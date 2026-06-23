@@ -25,7 +25,6 @@ env/
 
 # Environment
 .env
-.venv
 
 # OS
 .DS_Store
@@ -33,6 +32,10 @@ Thumbs.db
 
 # Claude
 .claude/
+
+# Output/Results
+output/
+results/
 
 # Git
 .git/

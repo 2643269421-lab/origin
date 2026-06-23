@@ -1,0 +1,7 @@
+[project]
+name = "swmm2ai-experiment-master1"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "matplotlib>=3.10.9",
+]
