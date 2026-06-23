@@ -1,0 +1,25 @@
+[project]
+name = "origin"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "args>=0.1.0",
+    "datasetsforecast>=1.0.0",
+    "matplotlib>=3.10.9",
+    "numpy>=2.4.6",
+    "on>=0.0.4",
+    "pandas>=3.0.3",
+    "pandas-stubs~=3.0.3",
+    "pyswmm>=2.1.0",
+    "python-qt5>=0.1.10",
+    "pyyaml>=6.0.3",
+    "scikit-learn>=1.8.0",
+    "self>=2020.12.3",
+    "simplemlp>=1.0.1",
+    "swmm-api>=0.4.73",
+    "termine>=0.1.5",
+    "torch>=2.12.0",
+    "torch-geometric>=2.7.0",
+    "torchvision>=0.27.0",
+    "utils>=1.0.2",
+]
