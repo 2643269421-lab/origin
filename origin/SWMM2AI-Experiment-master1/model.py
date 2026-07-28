@@ -3,6 +3,7 @@ import sys
 sys.path.append(r"C:\Users\26432\Desktop\origin\origin\SWMM2AI-Experiment-master1")
 
 from attention import CausalAttentionLSTM
+from attention import RandomMaskAttentionLSTM
 from gru import SimpleGRU
 from lstm import SimpleLSTM
 from attention import AttentionLSTM
@@ -29,6 +30,7 @@ MODEL_REGISTRY = {
     'SimpleLSTM': SimpleLSTM,
     'SimpleGRU': SimpleGRU,
     'AttentionLSTM': AttentionLSTM,
+    'RandomMaskAttentionLSTM': RandomMaskAttentionLSTM,
     'CausalAttentionLSTM': CausalAttentionLSTM,
     'PCCA-LSTM': PCCALSTM,
 }
@@ -47,7 +49,7 @@ class Trainer:
     def train(self, n_events=100, seq_length=288, time_step_min=5, epochs=200, lr=0.001,
               max_return_period=None, loss_type='mse',
               lambda_smooth=0.01, lambda_peak=0.05, lambda_mass=0.0,
-              node_physics_params=None):
+              node_physics_params=None, template_inp_path=None):
         """主程序：训练模型
 
         Args:
@@ -77,6 +79,8 @@ class Trainer:
         )
         if max_return_period is not None:
             dataset_kwargs['max_return_period'] = max_return_period
+        if template_inp_path is not None:
+            dataset_kwargs['template_inp_path'] = template_inp_path
 
         dataset = SWMMDataset(**dataset_kwargs)
 

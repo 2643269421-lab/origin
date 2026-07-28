@@ -54,6 +54,18 @@ MODEL_CONFIGS = [
     {'type': 'PCCA-LSTM',           'name': 'PCCA-LSTM (Ours)',   'color': '#4472C4', 'ls': '-'},
 ]
 
+# M4: 中间消融配置 — CA-LSTM + 单损失项 (响应审稿意见M4)
+INTERMEDIATE_ABLATION_CONFIGS = [
+    {'type': 'CausalAttentionLSTM', 'name': 'CA-LSTM + SmoothLoss only',
+     'color': '#e8a87c', 'ls': '--',
+     'loss_type': 'physically_consistent', 'lambda_smooth': 0.01, 'lambda_peak': 0.0,
+     'description': '仅SmoothLoss (λ₁=0.01, λ₂=0)'},
+    {'type': 'CausalAttentionLSTM', 'name': 'CA-LSTM + PeakTimeLoss only',
+     'color': '#95e1d3', 'ls': '--',
+     'loss_type': 'physically_consistent', 'lambda_smooth': 0.0, 'lambda_peak': 0.05,
+     'description': '仅PeakTimeLoss (λ₁=0, λ₂=0.05)'},
+]
+
 print(f"Output: {OUTPUT_ROOT}"); print(f"Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
 
 
@@ -85,6 +97,136 @@ def train_pcca_lstm():
     )
     print("PCCA-LSTM training done!")
     return pcca_path
+
+
+# ═══════════════════════════════════════════════════════════════
+#  M4: 训练中间消融模型 (CA-LSTM + SmoothLoss only / PeakTimeLoss only)
+#  响应审稿意见M4 — 消融实验粒度
+# ═══════════════════════════════════════════════════════════════
+def train_intermediate_ablation(cfg):
+    """训练单个中间消融配置 (CA-LSTM + 单项损失)"""
+    model_path = os.path.join(OUTPUT_ROOT, f'ablation_{cfg["name"].replace(" ", "_").replace("-", "_").lower()}.pth')
+
+    if os.path.exists(model_path):
+        print(f"[SKIP] {cfg['name']} already trained: {model_path}")
+        return model_path
+
+    print(f"\n{'='*60}")
+    print(f"  M4 Ablation: {cfg['name']} ({cfg['description']})")
+    print(f"{'='*60}")
+
+    trainer = Trainer(
+        model_type=cfg['type'],
+        model_params={'input_size': 1, 'hidden_size': 128, 'num_layers': 2, 'output_size': 1},
+        model_path=model_path,
+        device='cuda' if torch.cuda.is_available() else 'cpu'
+    )
+    model, dataset = trainer.train(
+        n_events=N_TRAIN, seq_length=SEQ_LEN, epochs=EPOCHS,
+        loss_type=cfg['loss_type'],
+        lambda_smooth=cfg['lambda_smooth'],
+        lambda_peak=cfg['lambda_peak'],
+        max_return_period=TRAIN_MAX_RP
+    )
+    print(f"{cfg['name']} training done!")
+    return model_path
+
+
+# ═══════════════════════════════════════════════════════════════
+#  M6: λ₁, λ₂ 敏感性分析
+#  响应审稿意见M6 — 损失函数权重系数的确定过程
+# ═══════════════════════════════════════════════════════════════
+def weight_sensitivity_analysis():
+    """M6: λ₁ (SmoothLoss) 和 λ₂ (PeakTimeLoss) 网格搜索敏感性分析"""
+    print("\n" + "=" * 60)
+    print("  M6: λ Sensitivity Analysis — Grid Search")
+    print("=" * 60)
+
+    lambda_smooth_values = [0.001, 0.005, 0.01, 0.05, 0.1]
+    lambda_peak_values = [0.005, 0.01, 0.05, 0.1, 0.2]
+    results = []
+
+    for lam_s in lambda_smooth_values:
+        for lam_p in lambda_peak_values:
+            tag = f"lambda_s{lam_s}_p{lam_p}".replace('.', '_')
+            model_path = os.path.join(OUTPUT_ROOT, f'sensitivity_{tag}.pth')
+
+            print(f"\n  Training with λ₁={lam_s}, λ₂={lam_p}...")
+
+            trainer = Trainer(
+                model_type='PCCA-LSTM',
+                model_params={'input_size': 1, 'hidden_size': 128, 'num_layers': 2, 'output_size': 1},
+                model_path=model_path,
+                device='cuda' if torch.cuda.is_available() else 'cpu'
+            )
+            model, dataset = trainer.train(
+                n_events=N_TRAIN, seq_length=SEQ_LEN, epochs=EPOCHS,
+                loss_type='physically_consistent',
+                lambda_smooth=lam_s, lambda_peak=lam_p,
+                max_return_period=TRAIN_MAX_RP
+            )
+
+            # 快速验证集评估
+            predictor = Predictor(model_path=model_path, output_dir=OUTPUT_ROOT,
+                                  device='cuda' if torch.cuda.is_available() else 'cpu')
+            # 生成少量验证数据评估
+            from swmm.simulator import SWMMSimulator
+            from swmm.rainfall.generator import RainfallGenerator
+            rg = RainfallGenerator(time_step_min=DT)
+            sim = SWMMSimulator(template_inp_path='template.inp', output_dir=OUTPUT_ROOT,
+                               output_element='SN_001', output_type='node', output_variable='depth')
+            val_rains, val_waters = [], []
+            for _ in range(15):
+                rain = rg.generate_rainfall_event(
+                    seq_length=SEQ_LEN, rain_type='chicago',
+                    duration_hours=np.random.uniform(1, 6),
+                    return_period=100, peak_position=np.random.uniform(0.3, 0.7),
+                    start_idx=np.random.randint(0, 36))
+                res = sim.run_swmm_simulation(rainfall_mm_h=rain)
+                if res and len(res['values']) == SEQ_LEN:
+                    val_rains.append(rain); val_waters.append(res['values'])
+
+            if val_rains:
+                val_rains = np.array(val_rains); val_waters = np.array(val_waters)
+                preds = predictor.predict_batch(val_rains)
+                mse_vals = [np.mean((p - t) ** 2) for p, t in zip(preds, val_waters)]
+                rmse_val = float(np.sqrt(np.mean(mse_vals)))
+                dh_vals = [np.mean(np.sign(np.diff(p)) == np.sign(np.diff(t))) * 100
+                          for p, t in zip(preds, val_waters)]
+                dh_agree = float(np.mean(dh_vals))
+            else:
+                rmse_val = float('nan')
+                dh_agree = float('nan')
+
+            results.append({
+                'lambda_smooth': lam_s, 'lambda_peak': lam_p,
+                'val_RMSE': rmse_val, 'val_DASR': dh_agree,
+            })
+            print(f"    → Val RMSE={rmse_val:.5f}, DASR={dh_agree:.1f}%")
+
+    # 输出敏感性分析结果表
+    print("\n" + "=" * 70)
+    print("  M6 Sensitivity Analysis Results (sorted by Val RMSE)")
+    print("=" * 70)
+    results.sort(key=lambda r: (r['val_RMSE'], -r['val_DASR']))
+    print(f"{'λ₁':>8}  {'λ₂':>8}  {'Val RMSE':>10}  {'Val DASR(%)':>12}")
+    print("-" * 44)
+    for r in results:
+        print(f"{r['lambda_smooth']:8.3f}  {r['lambda_peak']:8.3f}  {r['val_RMSE']:10.5f}  {r['val_DASR']:12.1f}")
+
+    # 找到最佳组合 (RMSE最低且DASR≥70%)
+    pareto = [r for r in results if r['val_DASR'] >= 70.0]
+    if pareto:
+        best = min(pareto, key=lambda r: r['val_RMSE'])
+        print(f"\n  ★ Best (DASR≥70%): λ₁={best['lambda_smooth']}, λ₂={best['lambda_peak']} "
+              f"→ RMSE={best['val_RMSE']:.5f}, DASR={best['val_DASR']:.1f}%")
+
+    # 保存结果
+    sens_path = os.path.join(OUTPUT_ROOT, 'weight_sensitivity.json')
+    with open(sens_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  敏感性分析结果已保存: {sens_path}")
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -260,17 +402,23 @@ def make_figs(error_results, dhdt, pk_time, runoff, test_data, predictors):
     print("  Generating figures...")
     print("=" * 60)
 
-    # ── Fig 1: RMSE & R2 bar chart ──
+    # ── Fig 1: RMSE & R2 bar chart (all 5 models incl M4 intermediate) ──
+    all_models = MODEL_CONFIGS + [
+        {'name': c['name'], 'color': c['color'], 'ls': c['ls']}
+        for c in INTERMEDIATE_ABLATION_CONFIGS
+    ]
     fig, axes = plt.subplots(2, 2, figsize=(16, 12)); axes = axes.flatten()
-    x = np.arange(len(EXTREME_RPS)); w = 0.25
+    x = np.arange(len(EXTREME_RPS)); w = 0.16  # narrower bars for 5 models
     for idx, metric in enumerate(['RMSE', 'MAE', 'MAPE', 'R2']):
         ax = axes[idx]
-        for j, cfg in enumerate(MODEL_CONFIGS):
+        for j, cfg in enumerate(all_models):
             name = cfg['name']
+            if name not in error_results[EXTREME_RPS[0]]:
+                continue  # skip if no results for this model
             vals = [error_results[rp][name][metric][0] for rp in EXTREME_RPS]
             stds = [error_results[rp][name][metric][1] for rp in EXTREME_RPS]
             ax.bar(x + j*w, vals, w, yerr=stds, color=cfg['color'], label=name, capsize=3, alpha=0.9)
-        ax.set_xticks(x + w)
+        ax.set_xticks(x + w * 2)  # center ticks across 5 bars
         ax.set_xticklabels([f'{rp}yr' for rp in EXTREME_RPS])
         ax.set_title(metric, fontweight='bold', fontsize=13)
         ax.legend(fontsize=7); ax.grid(True, alpha=0.3, axis='y')
@@ -279,46 +427,52 @@ def make_figs(error_results, dhdt, pk_time, runoff, test_data, predictors):
     fig.savefig(os.path.join(FIG_DIR, 'ablation_error_bars.png'), dpi=150, bbox_inches='tight')
     plt.close(); print("  -> ablation_error_bars.png")
 
-    # ── Fig 2: Physical Consistency 3-panel summary ──
+    # ── Fig 2: Physical Consistency 3-panel summary (incl M4 models) ──
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     # Sign agreement
     ax = axes[0]
-    for j, cfg in enumerate(MODEL_CONFIGS):
+    for j, cfg in enumerate(all_models):
         name = cfg['name']
+        if name not in dhdt[EXTREME_RPS[0]]:
+            continue
         vals = [dhdt[rp][name]['SignAgree'] for rp in EXTREME_RPS]
         ax.plot(EXTREME_RPS, vals, 'o-', color=cfg['color'], linewidth=2, markersize=8, label=name)
-    ax.set_xlabel('Return Period (yr)'); ax.set_ylabel('Sign Agreement (%)')
-    ax.set_title('Exp 1: ΔH/Δt Direction Consistency', fontweight='bold')
-    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+    ax.set_xlabel('Return Period (yr)'); ax.set_ylabel('DASR (%)')
+    ax.set_title('Exp 1: DASR (ΔH/Δt Direction Agreement with SWMM Reference)', fontweight='bold')
+    ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
 
     # Peak time
     ax = axes[1]
-    for j, cfg in enumerate(MODEL_CONFIGS):
+    for j, cfg in enumerate(all_models):
         name = cfg['name']
+        if name not in pk_time[EXTREME_RPS[0]]:
+            continue
         vals = [pk_time[rp][name]['MAE'] for rp in EXTREME_RPS]
         ax.plot(EXTREME_RPS, vals, 's--', color=cfg['color'], linewidth=2, markersize=8, label=name)
     ax.set_xlabel('Return Period (yr)'); ax.set_ylabel('Peak Time MAE (min)')
     ax.set_title('Exp 2: Peak Time Error', fontweight='bold')
-    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
 
     # Runoff phi
     ax = axes[2]
     swmm_phis = [runoff[rp][list(runoff[rp].keys())[0]]['phi_SWMM'] for rp in EXTREME_RPS]
-    ax.plot(EXTREME_RPS, swmm_phis, 'ko-', linewidth=3, markersize=10, label='SWMM (GT)')
-    for j, cfg in enumerate(MODEL_CONFIGS):
+    ax.plot(EXTREME_RPS, swmm_phis, 'ko-', linewidth=3, markersize=10, label='SWMM (Reference)')
+    for j, cfg in enumerate(all_models):
         name = cfg['name']
+        if name not in runoff[EXTREME_RPS[0]]:
+            continue
         vals = [runoff[rp][name]['phi_pred'] for rp in EXTREME_RPS]
         ax.plot(EXTREME_RPS, vals, 'D-', color=cfg['color'], linewidth=2, markersize=7, label=name)
     ax.set_xlabel('Return Period (yr)'); ax.set_ylabel('phi = Sum(H)/Sum(P) (m/mm)')
     ax.set_title('Exp 3: Runoff Response Ratio', fontweight='bold')
-    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
 
     fig.suptitle('3.5 Physical Consistency Analysis — Three-Model Comparison', fontsize=14, fontweight='bold')
     plt.tight_layout()
     fig.savefig(os.path.join(FIG_DIR, 'physical_consistency_3model.png'), dpi=150, bbox_inches='tight')
     plt.close(); print("  -> physical_consistency_3model.png")
 
-    # ── Fig 3: Extreme event overlay (best vs worst for T=100yr) ──
+    # ── Fig 3: Extreme event overlay (best vs worst for T=100yr, incl M4) ──
     fig, ax = plt.subplots(figsize=(14, 6))
     rp = 100
     rain = test_data[rp]['rainfall']
@@ -328,13 +482,15 @@ def make_figs(error_results, dhdt, pk_time, runoff, test_data, predictors):
     ax2 = ax.twinx()
     ax2.bar(time_h, rain[best_i], width=DT/60/1.5, alpha=0.15, color='steelblue', label='Rainfall')
     ax2.set_ylabel('Rainfall Intensity (mm/h)', color='steelblue')
-    ax.plot(time_h, swmm_w[best_i], 'k-', linewidth=2.5, label='SWMM (Ground Truth)', alpha=0.9)
-    for cfg in MODEL_CONFIGS:
+    ax.plot(time_h, swmm_w[best_i], 'k-', linewidth=2.5, label='SWMM (Reference)', alpha=0.9)
+    for cfg in all_models:
         name = cfg['name']
+        if name not in predictors:
+            continue
         preds = predictors[name].predict_batch(rain)
         ax.plot(time_h, preds[best_i], color=cfg['color'], linestyle=cfg['ls'], linewidth=2, label=name)
     ax.set_xlabel('Time (h)'); ax.set_ylabel('Water Depth (m)')
-    ax.set_title(f'T=100yr Extreme Event — 3-Model Prediction Overlay', fontweight='bold', fontsize=13)
+    ax.set_title(f'T=100yr Extreme Event — 5-Model Comparison (incl. M4 Intermediate Ablation)', fontweight='bold', fontsize=13)
     h1,l1=ax.get_legend_handles_labels(); h2,l2=ax2.get_legend_handles_labels()
     ax.legend(h1+h2,l1+l2, loc='upper right', fontsize=9)
     ax.grid(True, alpha=0.3)
@@ -343,9 +499,9 @@ def make_figs(error_results, dhdt, pk_time, runoff, test_data, predictors):
     plt.close(); print("  -> extreme_100yr_3model.png")
 
     # ── Fig 4: Comprehensive comparison matrix ──
-    n_models = len(MODEL_CONFIGS); n_rps = len(EXTREME_RPS)
+    n_models = len(all_models); n_rps = len(EXTREME_RPS)
     fig, axes = plt.subplots(n_models, n_rps, figsize=(5*n_rps, 3.5*n_models))
-    for i, cfg in enumerate(MODEL_CONFIGS):
+    for i, cfg in enumerate(all_models):
         name = cfg['name']
         for j, rp in enumerate(EXTREME_RPS):
             ax = axes[i, j] if n_models > 1 else axes[j]
@@ -509,7 +665,9 @@ def build_paper(error_results, dhdt, pk_time, runoff):
     Tbl(headers_abl, rows_abl)
 
     P('', indent=False)
+    # M4: Add intermediate ablation result discussion
     P('消融实验结果表明：1) 因果注意力机制相较于标准LSTM在所有指标上均有显著提升（RMSE降低约55%），验证了时间因果性约束对序列建模的重要性；2) 在相同网络结构下，物理一致性损失（时序正则化）函数进一步提升了外推性能——PCCA-LSTM相比CA-LSTM在极端重现期下的RMSE仍有额外降低，且性能退化幅度更小（详见3.4节）。')
+    P('关于M4中间消融配置（CA-LSTM + SmoothLoss only和CA-LSTM + PeakTimeLoss only）：若计算结果可用，以下将报告两组配置在T=100yr下的独立贡献分解。由于计算资源限制，若两组实验未能完成运行，表3-9中的损失项→检验指标映射应被视为"预期作用方向"而非因果证实的独立贡献，并将在结论中列为后续工作。', indent=False)
 
     Img('ablation_error_bars.png', 'Figure 1  Ablation Study — Error Metrics Bar Chart Comparison')
 
@@ -628,8 +786,32 @@ def main():
     # 1. Train PCCA-LSTM
     pcca_path = train_pcca_lstm()
 
-    # 2. Load models
+    # 1b. M4: Train intermediate ablation models (CA-LSTM + single loss)
+    intermediate_paths = []
+    for cfg in INTERMEDIATE_ABLATION_CONFIGS:
+        p = train_intermediate_ablation(cfg)
+        intermediate_paths.append(p)
+
+    # 1c. M6: Weight sensitivity analysis (can be skipped if results.json exists)
+    sens_json = os.path.join(OUTPUT_ROOT, 'weight_sensitivity.json')
+    if not os.path.exists(sens_json):
+        print("\n[M6] Running weight sensitivity analysis...")
+        weight_sensitivity_analysis()
+    else:
+        print(f"\n[M6] Sensitivity results already exist: {sens_json}")
+
+    # 2. Load models (including intermediate ablation models)
     predictors = load_models(pcca_path)
+
+    # 2b. M4: Load intermediate ablation predictors
+    for i, cfg in enumerate(INTERMEDIATE_ABLATION_CONFIGS):
+        name = cfg['name']
+        if cfg['name'] not in predictors:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            p = Predictor(model_path=intermediate_paths[i], output_dir=OUTPUT_ROOT, device=device)
+            p.color = cfg['color']; p.ls = cfg['ls']
+            predictors[name] = p
+            print(f"Loaded {name}: {intermediate_paths[i]}")
 
     # 3. Generate test data
     test_data = generate_test_data()

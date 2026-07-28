@@ -15,7 +15,8 @@ class SWMMDataset(Dataset):
                  time_step_min: int = 5,
                  swmm_simulator: SWMMSimulator = None,
                  max_return_period: int = None,
-                 return_period: int = None):
+                 return_period: int = None,
+                 template_inp_path: str = None):
         """
         初始化数据集
 
@@ -27,19 +28,22 @@ class SWMMDataset(Dataset):
             swmm_simulator: SWMM模拟器实例
             max_return_period: 最大重现期（仅生成 ≤ 此值的降雨事件，用于训练集约束）
             return_period: 固定重现期（用于生成特定重现期的测试集）
+            template_inp_path: SWMM模板文件路径 (用于多管网实验)
         """
         self.n_events = n_events
         self.seq_length = seq_length
         self.time_step_min = time_step_min
         self.max_return_period = max_return_period
         self.return_period = return_period
+        self.template_inp_path = template_inp_path
 
         # 创建暴雨生成器
         self.rainfall_generator = RainfallGenerator(time_step_min=time_step_min)
 
         # 创建SWMM模拟器（如果未提供）
         if swmm_simulator is None:
-            self.simulator = SWMMSimulator(template_inp_path='template.inp', output_element='SN_001', output_type='node', output_variable='depth')
+            inp = template_inp_path if template_inp_path else 'template.inp'
+            self.simulator = SWMMSimulator(template_inp_path=inp, output_element='SN_001', output_type='node', output_variable='depth')
         else:
             self.simulator = swmm_simulator
 

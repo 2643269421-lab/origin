@@ -136,6 +136,92 @@ class CausalAttentionLSTM(nn.Module):
 
 
 # ============================================================
+# Random Mask Attention LSTM — 对照实验
+# 使用固定的随机掩码（既非双向也非因果），
+# 用于排除"注意力惩罚源于过拟合/参数量"的替代假设。
+# 若随机掩码性能介于双向和因果之间，则证明因果性本身是关键。
+# ============================================================
+@register_model("RandomMaskAttentionLSTM")
+class RandomMaskAttentionLSTM(nn.Module):
+    """随机掩码注意力LSTM — 注意力惩罚归因对照实验"""
+    def __init__(self, input_size=1, hidden_size=128, num_layers=2,
+                 output_size=1, dropout=0.3, mask_ratio=0.5, mask_seed=2024):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.mask_ratio = mask_ratio
+        self.mask_seed = mask_seed
+
+        # LSTM层
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=False
+        )
+
+        # 因果注意力层 (与CausalAttentionLSTM结构相同)
+        self.attention = nn.Linear(hidden_size, 1)
+
+        # 全连接层
+        self.fc = nn.Linear(hidden_size * 2, output_size)
+
+        # 预生成固定随机掩码 (在forward中按需裁剪)
+        self._mask_rng = np.random.RandomState(mask_seed)
+
+    def _get_random_mask(self, seq_len, device):
+        """生成固定的随机注意力掩码 (每次调用相同seed → 相同掩码)"""
+        rng = np.random.RandomState(self.mask_seed)
+        # 生成 seq_len x seq_len 的随机掩码
+        mask = rng.random((seq_len, seq_len)) < self.mask_ratio
+        # 确保对角线可见（当前时间步总能看到自己）
+        np.fill_diagonal(mask, True)
+        # 转为 float mask: True=可见, False=被遮蔽
+        mask_tensor = torch.tensor(mask, dtype=torch.float32, device=device)
+        return mask_tensor  # (seq_len, seq_len)
+
+    def forward(self, x):
+        # x: (batch, seq_len, input_size)
+        lstm_out, _ = self.lstm(x)  # (batch, seq_len, hidden)
+        batch_size, seq_len, hidden = lstm_out.shape
+
+        # 获取随机掩码
+        mask = self._get_random_mask(seq_len, x.device)  # (seq_len, seq_len)
+
+        outputs = []
+        for t in range(seq_len):
+            # 对时间步t，获取可见位置
+            visible_mask = mask[t]  # (seq_len,) — 1.0=可见, 0.0=遮蔽
+
+            # 计算注意力分数
+            attn_scores = self.attention(lstm_out).squeeze(-1)  # (batch, seq_len)
+
+            # 应用掩码: 被遮蔽位置设为-inf
+            masked_scores = attn_scores.masked_fill(
+                visible_mask.unsqueeze(0) == 0, float('-inf')
+            )
+            attn_weights = torch.softmax(masked_scores, dim=1)  # (batch, seq_len)
+
+            # 加权平均
+            context = torch.bmm(
+                attn_weights.unsqueeze(1), lstm_out
+            )  # (batch, 1, hidden)
+
+            # 当前时间步
+            current = lstm_out[:, t:t+1, :]  # (batch, 1, hidden)
+
+            # 拼接
+            combined = torch.cat([current, context], dim=2)  # (batch, 1, hidden*2)
+            pred = self.fc(combined)
+            outputs.append(pred)
+
+        return torch.cat(outputs, dim=1)
+
+
+# ============================================================
 # PCCA-LSTM (Physically Consistent Causal Attention LSTM)
 # 架构与 CausalAttentionLSTM 完全相同，
 # 区别仅在于训练时使用 PhysicallyConsistentLoss（见 physics_loss.py）
